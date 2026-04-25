@@ -1,208 +1,136 @@
-# Building a Cloud SIEM from Scratch with Microsoft Sentinel
+# I Built a Cloud SIEM from Scratch — Here's Everything That Went Wrong (and Right)
 
-> A hands-on walkthrough of deploying Microsoft Sentinel, onboarding a local Windows machine via Azure Arc, integrating Sysmon for deep endpoint visibility, and enabling analytics rules for automated threat detection.
+I wanted to understand how security operations actually work. Not from a course. Not from a certification study guide. From building the thing myself, breaking it, and fixing it until logs were flowing and detections were firing.
 
-![Microsoft Defender Analytics Dashboard](screenshots/08-defender-analytics-rules.png)
+This is Part 1 of a larger project. The end goal is a full multi-zone security operations lab — Active Directory attacks, IDS, purple teaming, forensics, incident response — the whole pipeline. But every SOC starts the same way: you need a SIEM that actually works, collecting real data, from real endpoints.
 
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [What We're Building](#what-were-building)
-- [Phase 1: Setting Up the Foundation](#phase-1-setting-up-the-foundation)
-- [Phase 2: Connecting a Local Windows Machine](#phase-2-connecting-a-local-windows-machine)
-- [Phase 3: Installing Sysmon for Enhanced Visibility](#phase-3-installing-sysmon-for-enhanced-visibility)
-- [Phase 4: Streaming Sysmon Logs to Sentinel](#phase-4-streaming-sysmon-logs-to-sentinel)
-- [Phase 5: Enabling Analytics Rules for Threat Detection](#phase-5-enabling-analytics-rules-for-threat-detection)
-- [Architecture Overview](#architecture-overview)
-- [All Possible Log Collection Methods](#all-possible-log-collection-methods)
-- [Troubleshooting Guide](#troubleshooting-guide)
-- [What's Next](#whats-next)
+So that's where I started.
 
 ---
 
-## Overview
+## What I Built (So Far)
 
-SIEM (Security Information and Event Management) is the backbone of any security operations team. It centralizes logs, correlates events, and detects threats in real time.
+The short version: Microsoft Sentinel collecting Windows Security Events and Sysmon telemetry from a local machine, with analytics rules running automated detections mapped to MITRE ATT&CK.
 
-In this project, I built a fully functional SIEM lab using **Microsoft Sentinel** — Microsoft's cloud-native SIEM and SOAR platform. The setup collects Windows Security Events and Sysmon telemetry from a local Windows machine, streams them to Azure through the Azure Monitor Agent (AMA), and runs analytics rules that automatically detect suspicious activity.
-
-This isn't a theoretical exercise. Every step documented here — including the errors and troubleshooting — comes from actually building this environment.
-
-**Technologies used:** Microsoft Sentinel, Azure Monitor Agent, Azure Arc, Sysmon, Log Analytics Workspace, KQL, Microsoft Defender Portal
-
----
-
-## What We're Building
+The longer version involves a lot more troubleshooting than I expected.
 
 ```
-Local Windows Machine
-├── Windows Security Events (logins, account changes, audit)
-└── Sysmon (process creation, network connections, file/registry changes)
-        │
-        ▼
-    Azure Arc (registers machine as Azure resource)
-        │
-        ▼
-    Azure Monitor Agent (auto-deployed via Arc)
-        │
-    ┌───┴───┐
-    ▼       ▼
-DCR 1     DCR 2
-Security  Sysmon
-Events    Events
-    │       │
-    ▼       ▼
-SecurityEvent   Event
-  table        table
-    │           │
-    └─────┬─────┘
-          ▼
-  Log Analytics Workspace
-          │
-          ▼
-   Microsoft Sentinel
-          │
-          ▼
-  Analytics Rules → Incidents → Investigation
+┌──────────────────────────────────────────────┐
+│               Azure Cloud                    │
+│                                              │
+│   Sentinel    Log Analytics    KQL Rules     │
+│  (SIEM/SOAR)  (log storage)  (detect/hunt)  │
+│                                              │
+└──────────────────┬───────────────────────────┘
+                   │ CEF · AMA · Syslog
+                   │
+┌──────────────────┴───────────────────────────┐
+│        DMZ — Log Aggregation Layer           │
+│                                              │
+│  pfSense FW   Suricata    Log         Log    │
+│  (gateway)    (IDS/IPS)   Forwarder   Parser │
+│                                              │
+└──────────────────┬───────────────────────────┘
+                   │ syslog · agents
+                   │
+┌──────────────────┴───────────────────────────┐
+│      Internal Network — Isolated VMs         │
+│      (no direct internet · 10.10.10.0/24)    │
+│                                              │
+│  Windows AD    Ubuntu      Kali      Win 10  │
+│  (lab.local    (DVWA       (attack   (target │
+│   DC)          web target)  VM)      endpoint)│
+│                                              │
+│  Agents: Wazuh · Sysmon · Filebeat           │
+└──────────────────────────────────────────────┘
+
+        All VMs run inside VirtualBox on the host
 ```
 
----
-
-## Phase 1: Setting Up the Foundation
-
-### Create the Log Analytics Workspace
-
-The Log Analytics workspace is where all log data lives. Every Sentinel deployment sits on top of one.
-
-1. In the Azure Portal, search for **"Log Analytics workspaces"**
-2. Click **+ Create**
-3. Select your Subscription and create a Resource Group (e.g., `SIEMLab`)
-4. Name the workspace (e.g., `siemlab`), pick a region
-5. **Review + Create → Create**
-
-### Enable Microsoft Sentinel
-
-Once the workspace is deployed:
-
-1. Search for **"Microsoft Sentinel"** in the portal
-2. Click **+ Create** → select your workspace → **Add**
-
-That's it. Sentinel is now active on top of your workspace.
-
-### Configure the Data Connector
-
-This tells Sentinel to start collecting Windows Security Events.
-
-1. In Sentinel, go to **Data connectors** under Configuration
-2. Search for **"Windows Security Events via AMA"**
-3. Click **Open connector page**
-4. Click **+ Create data collection rule**
-5. Name it (e.g., `DCR_Testing_1`), select **All Security Events**
-6. Complete the wizard
-
-![Windows Security Events via AMA connector with DCR configured](screenshots/02-ama-connector-dcr.png)
-
-> ⚠️ **Important:** Make sure you select **"Windows Security Events via AMA"** — NOT **"Security Events via Legacy Agent."** The legacy connector uses the deprecated MMA agent that Microsoft stopped supporting in August 2024.
-
-At this point the connector will show "Disconnected" because no machine is linked yet. That's expected.
+What's done is the Azure cloud layer and the initial endpoint connection. The DMZ and internal network layers are coming next.
 
 ---
 
-## Phase 2: Connecting a Local Windows Machine
+## The Boring But Important Stuff: Why These Choices
 
-Since the Windows machine isn't an Azure VM, we need **Azure Arc** to make it visible to Azure as a managed resource.
+Before touching anything in Azure, I spent time understanding the options. There are at least six different ways to get Windows logs into Sentinel, and picking the wrong one costs you time, money, or both.
 
-### Onboard with Azure Arc
+**Azure Monitor Agent (AMA) via Azure Arc** is what I went with. It's the current Microsoft-recommended method, it lets you filter events at the source through Data Collection Rules (so you're not paying to ingest garbage), and it auto-deploys through the Arc extension model. No manual agent installs, no maintenance headaches.
 
-1. In the Azure Portal, go to **Azure Arc → Machines → + Add/Create → Add a machine**
-2. Choose **"Add a single server"**
-3. Fill in the details (same subscription/resource group as your workspace)
-4. Click **"Generate script"** — download the PowerShell script
+The alternative most guides still reference is the **Legacy Log Analytics Agent (MMA)**. Microsoft deprecated it in August 2024. I actually landed on the legacy connector page by accident early on — the UI doesn't make the distinction obvious. If you're reading an older tutorial and it mentions "Workspace ID and Key," that's the old method. Skip it.
 
-![Azure Arc machine page showing Connected status](screenshots/04-azure-arc-machine.png)
+Other methods exist for different use cases: **Windows Event Forwarding** for large fleets where you don't want agents on every box, **Syslog/CEF forwarding** for network devices and Linux, **API ingestion** for custom apps, and **native cloud connectors** for SaaS services. I'll be using several of these as the lab expands.
 
-### Run the Onboarding Script
+For a single endpoint talking to a cloud SIEM, AMA + Arc is the right call.
 
-Open **PowerShell as Administrator** on your local machine and run the script.
+---
 
-If you get this error:
+## Phase 1: The Foundation
+
+### Log Analytics Workspace + Sentinel
+
+Nothing complicated here. Create a Log Analytics workspace in Azure, add Sentinel on top of it. The workspace stores the data, Sentinel provides the detection and investigation layer. Two clicks, basically.
+
+### The Data Connector
+
+In Sentinel, I set up the **Windows Security Events via AMA** connector and created a Data Collection Rule configured to collect all security events. At this point the connector shows "Disconnected" because no machine is linked yet. That's normal — you need to bring a machine into Azure's world first.
+
+### Azure Arc: Making a Local Machine Visible to Azure
+
+This is the bridge. Since my Windows machine isn't an Azure VM, Azure doesn't know it exists. Azure Arc fixes that by registering the machine as a managed resource.
+
+The process: generate an onboarding script in the Azure Arc portal, download it, run it in PowerShell as admin. It authenticates you, registers the machine, and you're done.
+
+Except I immediately hit this:
 
 ```
 The file OnboardingScript.ps1 is not digitally signed. 
 You cannot run this script on the current system.
 ```
 
-Fix it with:
+Standard Windows execution policy block. The fix is one line:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```
 
-This only applies to your current PowerShell session — safe and temporary. Then run the script again:
+The `-Scope Process` flag means it only applies to your current terminal session. Doesn't change anything permanently. Run the script again, authenticate, and the machine shows up in Azure Arc as "Connected."
 
-```powershell
-.\OnboardingScript.ps1
-```
+### Linking the Machine to the DCR
 
-It will prompt you to authenticate with your Azure credentials. Once complete, your machine appears in Azure Arc with **"Connected"** status.
+Back in the Sentinel connector page, edit the DCR, go to the Resources tab, check the box next to the Arc-enabled machine, save. Azure automatically pushes the AMA extension to the machine. After about five minutes, logs start flowing.
 
-### Link the Machine to the DCR
-
-1. Go back to **Sentinel → Data connectors → Windows Security Events via AMA**
-2. Click the **edit (pencil) icon** next to your DCR
-3. Go to the **Resources** tab
-4. Check the box next to your Arc-enabled machine
-5. **Apply**
-
-Azure automatically deploys the AMA extension to your machine through Arc. Wait 5–10 minutes.
-
-### Verify Logs Are Flowing
-
-In **Sentinel → Logs**, run:
+Verification is a simple KQL query:
 
 ```kql
 SecurityEvent
 | take 10
 ```
 
-If you see results, the pipeline is working. The connector status should flip to **"Connected."**
+Results came back. Pipeline working.
 
 ---
 
-## Phase 3: Installing Sysmon for Enhanced Visibility
+## Phase 2: Sysmon — Because Security Events Aren't Enough
 
-### Why Sysmon?
+Here's something I didn't fully appreciate until I looked at the data: standard Windows Security Events are mostly about authentication. Who logged in. Who got added to a group. Who changed a password. That's useful, but it misses almost everything that matters for actual threat detection.
 
-Standard Windows Security Events give you logins and account changes. But they miss the stuff that actually matters for threat detection:
+Sysmon fills the gap. It's a free Microsoft Sysinternals tool that logs process creation with full command lines, network connections per process, file creation, registry changes, DLL loading, DNS queries, process injection — the operational telemetry that maps to the MITRE ATT&CK framework.
 
-| Capability | Security Events | Sysmon |
-|---|---|---|
-| Login/logoff tracking | ✅ | ❌ |
-| Process creation with full command line | ❌ | ✅ (Event ID 1) |
-| Network connections per process | ❌ | ✅ (Event ID 3) |
-| DLL loading | ❌ | ✅ (Event ID 7) |
-| File creation monitoring | ❌ | ✅ (Event ID 11) |
-| Registry modifications | ❌ | ✅ (Event IDs 12/13/14) |
-| DNS queries per process | ❌ | ✅ (Event ID 22) |
-| Process injection detection | ❌ | ✅ (Event ID 8) |
+Without Sysmon, you can see that someone logged in. With Sysmon, you can see that after logging in, they ran `powershell.exe -enc [base64blob]`, which connected to `185.x.x.x:443`, dropped a file to `C:\Users\Public\payload.exe`, and added a registry key for persistence. That's the difference between knowing something happened and knowing what happened.
 
-Without Sysmon, you're blind to most of the MITRE ATT&CK framework.
+### Installing Sysmon
 
-### Installation (PowerShell)
-
-Open **PowerShell as Administrator**:
+Two ways to do it. PowerShell is faster and scriptable:
 
 ```powershell
-# Download Sysmon
+# Download
 Invoke-WebRequest -Uri "https://download.sysinternals.com/files/Sysmon.zip" `
   -OutFile "$env:USERPROFILE\Downloads\Sysmon.zip"
-
 Expand-Archive "$env:USERPROFILE\Downloads\Sysmon.zip" `
   -DestinationPath "$env:USERPROFILE\Downloads\Sysmon"
 
-# Download SwiftOnSecurity config (don't run Sysmon without a config — too noisy)
+# Grab the SwiftOnSecurity config — don't run Sysmon without one
 Invoke-WebRequest -Uri "https://raw.githubusercontent.com/SwiftOnSecurity/sysmon-config/master/sysmonconfig-export.xml" `
   -OutFile "$env:USERPROFILE\Downloads\Sysmon\sysmonconfig.xml"
 
@@ -211,101 +139,71 @@ cd "$env:USERPROFILE\Downloads\Sysmon"
 .\Sysmon64.exe -accepteula -i sysmonconfig.xml
 ```
 
-### Installation (GUI Method)
+The GUI path works too — download Sysmon from the Sysinternals page, extract, grab the SwiftOnSecurity config from GitHub, save it in the same folder. Either way, the final install step requires an elevated terminal because Sysmon runs as a system driver.
 
-If you prefer a graphical approach:
-
-1. Download Sysmon from [Microsoft Sysinternals](https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon)
-2. Extract the ZIP file
-3. Download the [SwiftOnSecurity config](https://github.com/SwiftOnSecurity/sysmon-config) — click `sysmonconfig-export.xml` → Raw → Save As
-4. Save the config file in the same folder as Sysmon
-5. Open **Terminal as Admin** and run: `.\Sysmon64.exe -accepteula -i sysmonconfig.xml`
-
-> **Note:** Even with the GUI method, the final install step requires an elevated terminal. Sysmon is a system driver.
-
-### Verify Sysmon
-
-```powershell
-# Check service status
-Get-Service Sysmon64
-
-# Verify events are being generated
-Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" -MaxEvents 5 | Format-List TimeCreated, Id, Message
-```
+Running Sysmon with no configuration is a mistake. The default settings generate so much noise that the signal-to-noise ratio is terrible. Use SwiftOnSecurity's config as a baseline and tune from there.
 
 ---
 
-## Phase 4: Streaming Sysmon Logs to Sentinel
+## Phase 3: Getting Sysmon Logs into Sentinel — Where I Got Stuck
 
-This is where things get tricky — and where I ran into the most issues.
+This is where I spent the most time and learned the most.
 
-### The Key Concept Most Guides Miss
+### The Problem I Didn't Expect
 
-**The Sentinel "Windows Security Events via AMA" connector only collects from the Windows Security log.** Sysmon writes to a completely different channel (`Microsoft-Windows-Sysmon/Operational`). These are two separate pipelines:
+After installing Sysmon, I assumed it would just flow into Sentinel through the existing AMA connector. It didn't. I ran queries, waited, ran more queries — nothing.
 
-| | Security Events Connector | Windows Event Logs DCR |
-|---|---|---|
-| **Configured in** | Sentinel Data Connectors | Azure Monitor → Data Collection Rules |
-| **Collects from** | Windows Security log only | Any Windows event channel |
-| **Sends data to** | SecurityEvent table | Event / WindowsEvent table |
-| **Works for Sysmon?** | ❌ No | ✅ Yes |
+Here's the thing nobody tells you upfront: **the Sentinel "Windows Security Events via AMA" connector only collects from the Windows Security log channel.** That's it. One channel. Sysmon writes to a completely different channel called `Microsoft-Windows-Sysmon/Operational`. They're separate pipelines.
 
-This means you need a **separate DCR created in Azure Monitor** — not through the Sentinel connector.
-
-### Create the Sysmon DCR
-
-1. Search for **"Monitor"** in the Azure Portal → open Azure Monitor
-2. Click **"Data Collection Rules"** → **+ Create**
-3. **Basics:** Name it `DCR-Sysmon`, select your resource group, set Platform Type to **Windows**
-4. **Resources:** Add your Arc-enabled machine
-5. **Collect and deliver:** Click **+ Add data source**
-   - Data source type: **"Windows Event Logs"** ← NOT "Windows Security Events"
-   - Switch to the **Custom** tab
-   - Enter: `Microsoft-Windows-Sysmon/Operational!*`
-   - Destination: your Log Analytics workspace
-6. **Review + Create**
-
-![Data Collection Rules showing both DCRs](screenshots/05-data-collection-rules.png)
-
-### The XPath Gotcha
-
-If you enter just `Microsoft-Windows-Sysmon/Operational` without the `!*`, you'll get this error:
-
-![XPath validation error](screenshots/03-xpath-validation-error.png)
-
-The `!*` means "collect all events from this channel." Without it, the query is invalid.
-
-For cost optimization, you can filter by specific Event IDs:
-
-```
-Microsoft-Windows-Sysmon/Operational!*[System[(EventID=1 or EventID=3 or EventID=11 or EventID=13 or EventID=22)]]
-```
-
-### Another Gotcha: Portal Compatibility
-
-If you try to create the Sysmon DCR through the Sentinel data connector (instead of Azure Monitor), the rule gets created in a format that the portal can't edit later:
-
-```
-"This data collection rule contains properties that are not 
-currently supported in the portal."
-```
-
-**Solution:** Always create Sysmon DCRs through **Azure Monitor → Data Collection Rules**, not through Sentinel.
-
-### Verify Sysmon Data in Sentinel
-
-After 5–10 minutes, check which tables are receiving data:
+To confirm this, I ran a broad search to see which tables were actually receiving data:
 
 ```kql
 search "[YourMachineName]"
 | summarize by $table
 ```
 
-![KQL query showing Event table now appears](screenshots/06-kql-tables-query.png)
+Result: `SecurityEvent`, `Heartbeat`, `InsightsMetrics`. No `Event` table. No Sysmon data.
 
-Before Sysmon: only `SecurityEvent`, `Heartbeat`, and `InsightsMetrics`. After: the `Event` table appears.
+### The Fix: A Separate DCR in Azure Monitor
 
-Check Sysmon event distribution:
+Sysmon needs its own Data Collection Rule, and it has to be created through **Azure Monitor** (not through the Sentinel data connector). The data source type must be **"Windows Event Logs"** — not "Windows Security Events." These sound similar but they go to completely different tables.
+
+| | Sentinel Connector | Azure Monitor DCR |
+|---|---|---|
+| Collects from | Windows Security log | Any Windows event channel |
+| Sends to | SecurityEvent table | Event table |
+| Works for Sysmon? | No | Yes |
+
+Steps: Azure Monitor → Data Collection Rules → Create → add the machine as a resource → add data source with type "Windows Event Logs" → Custom tab → enter the XPath:
+
+```
+Microsoft-Windows-Sysmon/Operational!*
+```
+
+### The XPath Gotcha
+
+My first attempt failed with a validation error because I entered `Microsoft-Windows-Sysmon/Operational` without the `!*` suffix. Azure needs that `!*` to know you want all events from the channel. Without it, the query is syntactically invalid.
+
+If you want to filter by specific event IDs to reduce cost:
+
+```
+Microsoft-Windows-Sysmon/Operational!*[System[(EventID=1 or EventID=3 or EventID=11 or EventID=13 or EventID=22)]]
+```
+
+### The Portal Compatibility Gotcha
+
+I also tried creating a Sysmon DCR through the Sentinel connector first (seemed logical). It created the rule, but when I tried to edit it later, the portal said "This data collection rule contains properties that are not currently supported in the portal." Had to delete it and recreate through Azure Monitor directly.
+
+### It Worked
+
+After creating the DCR the right way, I waited about 10 minutes and ran the search again:
+
+```kql
+search "[YourMachineName]"
+| summarize by $table
+```
+
+The `Event` table appeared. Then I checked the Sysmon distribution:
 
 ```kql
 Event
@@ -314,208 +212,121 @@ Event
 | sort by count_ desc
 ```
 
----
-
-## Phase 5: Enabling Analytics Rules for Threat Detection
-
-Without analytics rules, Sentinel is just a fancy log storage. Analytics rules are what turn it into a detection engine — they run KQL queries on a schedule and create **Incidents** when something suspicious is found.
-
-### Accessing Analytics (Defender Portal Migration)
-
-When you navigate to **Sentinel → Analytics** in the Azure portal, you'll see this:
-
-![Sentinel Analytics redirecting to Defender portal](screenshots/07-sentinel-analytics-redirect.png)
-
-Microsoft has moved Analytics to the **unified Defender portal** at [security.microsoft.com](https://security.microsoft.com). Click the link, connect your workspace if prompted, and you'll land on the analytics page.
-
-### Enabling Rule Templates
-
-The Defender portal has hundreds of rule templates. Filter by data sources that match your setup (**Security Events**, **Windows Security Events**).
-
-![Defender portal Analytics with rule templates](screenshots/08-defender-analytics-rules.png)
-
-**Rules I enabled for this lab:**
-
-| Rule | Severity | MITRE Tactic | What It Detects |
-|---|---|---|---|
-| Non Domain Controller AD Replication | High | Credential Access | DCSync attack attempts |
-| Security Event Log Cleared | Medium | Defense Evasion | Someone covering their tracks |
-| User Added to Administrators Group | Medium | Privilege Escalation | Unauthorized privilege elevation |
-| Brute Force / Failed Logon Attempts | Medium | Credential Access | Repeated failed logins |
-| Potential Fodhelper UAC Bypass | Medium | Privilege Escalation | UAC bypass technique |
-| Gain Code Execution via Build Events | Medium | Lateral Movement | Build system abuse |
-| Starting or Stopping Windows Services | Medium | Defense Evasion | Suspicious service manipulation |
-
-**To enable a rule:**
-
-1. Click a rule template → review the details panel
-2. Click **"Create rule"**
-3. Walk through the wizard (General → Rule logic → Incident settings)
-4. Defaults are fine for a lab — click **Create**
-
-Start with 5–10 rules. You can always enable more once you understand your baseline.
+Process creation events, registry changes, network connections — all flowing in. Two parallel pipelines feeding Sentinel: Security Events for authentication data, Sysmon for behavioral data.
 
 ---
 
-## Architecture Overview
+## Phase 4: Analytics Rules — Making Sentinel Actually Detect Things
 
-Here's the complete architecture of what we built:
+Up to this point, Sentinel was collecting logs but not doing anything with them. It's just a really expensive log storage system until you turn on analytics rules.
 
-```
-┌──────────────────────────────────────────┐
-│         Local Windows Machine            │
-│                                          │
-│  ┌─────────────────┐  ┌──────────────┐  │
-│  │ Windows Security │  │   Sysmon     │  │
-│  │   Event Log      │  │  (Driver +   │  │
-│  │                  │  │   Service)   │  │
-│  └────────┬─────────┘  └──────┬───────┘  │
-│           │                    │          │
-│  ┌────────┴────────────────────┴───────┐ │
-│  │     Azure Monitor Agent (AMA)       │ │
-│  │   (deployed via Arc extension)      │ │
-│  └────────────────┬────────────────────┘ │
-│                   │                      │
-│  ┌────────────────┴────────────────────┐ │
-│  │  Azure Arc Connected Machine Agent  │ │
-│  └────────────────┬────────────────────┘ │
-└───────────────────┼──────────────────────┘
-                    │ HTTPS (443)
-                    ▼
-┌──────────────────────────────────────────┐
-│              Microsoft Azure             │
-│                                          │
-│  ┌──────────────┐  ┌──────────────────┐ │
-│  │DCR: Security │  │ DCR: Sysmon      │ │
-│  │   Events     │  │                  │ │
-│  └──────┬───────┘  └────────┬─────────┘ │
-│         │                    │           │
-│         ▼                    ▼           │
-│  SecurityEvent table    Event table      │
-│         │                    │           │
-│         └────────┬───────────┘           │
-│                  ▼                       │
-│     Log Analytics Workspace (siemlab)    │
-│                  │                       │
-│                  ▼                       │
-│        Microsoft Sentinel                │
-│                  │                       │
-│                  ▼                       │
-│  ┌────────────────────────────────────┐  │
-│  │    Analytics Rules (KQL queries)   │  │
-│  │              │                     │  │
-│  │              ▼                     │  │
-│  │         Incidents                  │  │
-│  │              │                     │  │
-│  │              ▼                     │  │
-│  │   Investigation & Response         │  │
-│  └────────────────────────────────────┘  │
-└──────────────────────────────────────────┘
-```
+Analytics rules are scheduled KQL queries. They run every few minutes, and when they find something that matches defined conditions, Sentinel creates an Incident. That's the detection engine.
+
+### The Defender Portal Migration
+
+When I went to Sentinel → Analytics in the Azure portal, the page was empty with a redirect notice. Microsoft has been unifying everything under the Defender portal at `security.microsoft.com`. Not a problem — just means analytics rules live there now.
+
+Connected the workspace to Defender, and the full template library showed up — hundreds of rules, each mapped to MITRE ATT&CK tactics and techniques.
+
+### What I Enabled
+
+I started with rules that match the data I'm actually collecting:
+
+| Rule | Severity | What It Catches |
+|---|---|---|
+| Non Domain Controller AD Replication | High | DCSync attacks — unauthorized AD replication |
+| Potential Fodhelper UAC Bypass | Medium | Known technique to bypass User Account Control |
+| Gain Code Execution via Build Events | Medium | Code execution through build system abuse |
+| Starting or Stopping Windows Services | Medium | Suspicious service manipulation |
+| AD FS Remote Auth | Medium | Unusual federation service authentication |
+| Microsoft Entra ID Discovery | Medium | Reconnaissance against Azure AD |
+
+I kept it to a small set intentionally. Alert fatigue is a real thing — if you enable 50 rules on day one, you drown in noise before you understand what normal looks like. Better to start small, learn the baseline, then expand.
 
 ---
 
-## All Possible Log Collection Methods
+## What I Learned That No Tutorial Taught Me
 
-Before building this, I researched all the ways you can get Windows logs into Sentinel. Here's the comparison:
+**The pipeline matters more than the SIEM.** Anyone can open Sentinel and run a query. Understanding why data isn't showing up — is the agent installed? Is it the right DCR type? Is the XPath valid? Is it hitting the right table? — that's the skill that actually matters in production. When something breaks in a real SOC, the analyst who understands the pipeline is the one who fixes it.
 
-| Method | Agent Required? | Best For | Status |
-|---|---|---|---|
-| **AMA + Azure Arc** ✅ | Yes (auto-deployed) | On-prem / hybrid machines | **Recommended** |
-| Legacy MMA/OMS | Yes (manual) | Legacy environments | **Deprecated** |
-| Windows Event Forwarding + AMA | On collector only | Large enterprise fleets (1000+ machines) | Active |
-| Syslog / CEF | On forwarder only | Network devices, firewalls, Linux | Active |
-| API Ingestion | No | Custom apps, IoT | Active |
-| Cloud Connectors | No | SaaS / cloud services (M365, Azure AD) | Active |
+**There are two separate log pipelines for Windows, and they're not interchangeable.** Sentinel's data connector handles Security Events. Azure Monitor DCRs handle everything else. Mixing them up is the fastest way to waste an afternoon staring at empty query results.
 
-**Why I chose AMA + Azure Arc:**
-- It's Microsoft's current recommended approach
-- Data Collection Rules allow filtering at the source (reduces cost)
-- Azure Arc makes the local machine a first-class Azure resource
-- AMA auto-deploys and auto-updates through Arc
-- Mirrors real enterprise hybrid deployments
+**The AMA doesn't run as a visible Windows service on Arc machines.** It operates through the Guest Configuration Extension Service. This tripped me up — `Get-Service AzureMonitorAgent` returns nothing, which looks like a broken install. But the Heartbeat table in Sentinel confirms the agent is alive and reporting. The binaries live at `C:\Packages\Plugins\Microsoft.Azure.Monitor.AzureMonitorWindowsAgent\`.
+
+**Microsoft is actively moving features to the Defender portal.** Analytics, incident management, and other Sentinel features are migrating to security.microsoft.com. If a page looks empty or broken in the Azure portal, check Defender before assuming something is wrong.
+
+**Sysmon without a config is useless in practice.** The default settings capture everything, which sounds good until you realize "everything" includes thousands of benign events per minute. SwiftOnSecurity's config is the industry starting point. Tune from there based on your environment.
 
 ---
 
-## Troubleshooting Guide
+## Where This Is Going
 
-Real issues I encountered during this build:
+What's running now is just the cloud layer. The full lab has three zones, and the next phases will build out the rest:
 
-### PowerShell Execution Policy Error
+**DMZ / Log Aggregation** — pfSense for network segmentation, Suricata for IDS/IPS, a log forwarder handling CEF and Syslog, Logstash or Fluent Bit for parsing and normalization. This layer sits between the internal network and Azure, aggregating and forwarding logs from all sources.
 
-```
-The file is not digitally signed. You cannot run this script on the current system.
-```
+**Internal Network** — isolated VMs on a host-only adapter at `10.10.10.0/24` with no direct internet access. A Windows Server running Active Directory as `lab.local`, an Ubuntu box running DVWA as a web application target, a Kali Linux VM as the attacker, and a Windows 10 endpoint as a target. All running Wazuh agents, Sysmon, and Filebeat/Winlogbeat.
 
-**Fix:**
+Once the internal network is up, the project shifts from building infrastructure to operating it:
+
+- **AD attack simulation** — Kerberoasting, Pass-the-Hash, DCSync, Golden Ticket using Impacket, Mimikatz, and BloodHound
+- **Detection engineering** — writing KQL rules for each attack technique, mapping to ATT&CK, documenting false positive conditions and tuning thresholds
+- **Purple team exercises** — running both sides of the attack/defense equation, measuring detection coverage as a number, identifying and closing gaps
+- **Digital forensics** — live endpoint analysis with Velociraptor across multiple machines simultaneously
+- **Incident response** — full IR cases through TheHive using PICERL methodology
+- **Coverage reporting** — MITRE ATT&CK Navigator heatmaps showing exactly what's detected and what isn't
+
+The end goal isn't a lab. It's being the person who has done the work — who can sit in a SOC, or in an interview, and give real answers built on real experience with real tools.
+
+---
+
+## Quick Reference
+
 ```powershell
+# Fix execution policy (session-scoped, temporary)
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-```
-Session-scoped, temporary, safe.
 
-### XPath Validation Error on DCR
-
-```
-Missing '!' between channel name and query expression.
-```
-
-**Fix:** Add `!*` after the channel name → `Microsoft-Windows-Sysmon/Operational!*`
-
-### AzureMonitorAgent Service Not Found
-
-```
-Cannot find any service with service name 'AzureMonitorAgent'.
-```
-
-**Fix:** On Arc-managed machines, AMA doesn't run as a standalone service. It runs through `ExtensionService` and `GCArcService`. Check these instead:
-
-```powershell
+# Check all services
+Get-Service Sysmon64
 Get-Service ExtensionService, GCArcService
+
+# Verify AMA extension exists
+Test-Path "C:\Packages\Plugins\Microsoft.Azure.Monitor.AzureMonitorWindowsAgent"
+
+# Check Sysmon is logging
+Get-WinEvent -LogName "Microsoft-Windows-Sysmon/Operational" -MaxEvents 5
 ```
 
-The AMA binaries live at `C:\Packages\Plugins\Microsoft.Azure.Monitor.AzureMonitorWindowsAgent\`.
+```kql
+-- Which tables are receiving data?
+search "[YourMachineName]"
+| summarize by $table
 
-### Sysmon Events Not Appearing in Sentinel
+-- Security events
+SecurityEvent | take 10
 
-**Root cause:** Created the DCR through the Sentinel data connector instead of Azure Monitor. The Sentinel connector only handles the Security log channel.
+-- Sysmon by event type
+Event
+| where Source == "Microsoft-Windows-Sysmon"
+| summarize count() by EventID
+| sort by count_ desc
 
-**Fix:** Delete the DCR. Recreate it in **Azure Monitor → Data Collection Rules** with data source type **"Windows Event Logs"** (not "Windows Security Events").
-
-### DCR Shows "Not Supported in Portal"
-
+-- Agent health
+Heartbeat
+| where Computer == "[YourMachineName]"
+| take 5
 ```
-This data collection rule contains properties that are not currently supported in the portal.
-```
-
-**Fix:** Delete and recreate through Azure Monitor instead of Sentinel.
-
-### Analytics Page Redirects
-
-**Expected behavior.** Microsoft migrated Analytics to the Defender portal at security.microsoft.com. Connect your workspace there.
 
 ---
 
-## What's Next
+## Tools
 
-The foundation is in place. Here's what I'm planning next:
-
-- [ ] **Custom KQL detection queries** — write rules targeting specific Sysmon events
-- [ ] **Workbook dashboards** — visualize login patterns, process creation trends, network connections
-- [ ] **Automation playbooks** — Logic Apps for automated incident response
-- [ ] **Attack simulation** — Atomic Red Team to test detection rules end-to-end
-- [ ] **Threat hunting** — proactive KQL queries using Sentinel's Hunting feature
-- [ ] **Additional data sources** — Azure AD logs, Microsoft 365, DNS
+- [Microsoft Sentinel](https://learn.microsoft.com/en-us/azure/sentinel/) — Cloud SIEM + SOAR
+- [Sysmon](https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon) — Endpoint telemetry
+- [SwiftOnSecurity Sysmon Config](https://github.com/SwiftOnSecurity/sysmon-config) — Tuned configuration
+- [MITRE ATT&CK](https://attack.mitre.org/) — Threat framework
+- [KQL Reference](https://learn.microsoft.com/en-us/azure/data-explorer/kql-quick-reference) — Query language docs
 
 ---
 
-## Tools & Resources
-
-- [Microsoft Sentinel Documentation](https://learn.microsoft.com/en-us/azure/sentinel/)
-- [Sysmon Download](https://learn.microsoft.com/en-us/sysinternals/downloads/sysmon)
-- [SwiftOnSecurity Sysmon Config](https://github.com/SwiftOnSecurity/sysmon-config)
-- [MITRE ATT&CK Framework](https://attack.mitre.org/)
-- [KQL Quick Reference](https://learn.microsoft.com/en-us/azure/data-explorer/kql-quick-reference)
-
----
-
-*Built by Martin | April 2026*
+*Martin — April 2026*
